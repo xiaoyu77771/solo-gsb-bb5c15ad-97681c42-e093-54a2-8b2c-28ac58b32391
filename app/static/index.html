@@ -2118,7 +2118,59 @@ function fillRestoreDigest() {
   if (d) $('mig-restore-digest').value = d.textContent.trim();
 }
 
+/* ---------- 迁移包 Blob 下载（可重入安全） ---------- */
+// click() 只是把下载异步交给浏览器，立即 revokeObjectURL 会让部分浏览器 /
+// 慢设备在读取 Blob 前拿到已失效的 URL（页面却提示成功、实际没有文件）。
+// 这里登记每个已交出的 object URL，延迟到浏览器开始读取后再释放；
+// 页面切换（pagehide / bfcache）时统一释放，避免内存泄漏。
+const MIG_DOWNLOAD_REVOKE_DELAY = 60000;  // 给浏览器充足的接管时间
+const migPendingDownloads = new Map();    // objectURL -> 释放定时器
+
+function releaseMigrationDownload(url) {
+  const timer = migPendingDownloads.get(url);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    migPendingDownloads.delete(url);
+  }
+  URL.revokeObjectURL(url);
+}
+
+function releaseAllMigrationDownloads() {
+  for (const url of Array.from(migPendingDownloads.keys())) {
+    releaseMigrationDownload(url);
+  }
+}
+
+// 页面切换 / 进入 bfcache / 关闭时释放全部未接管 URL，防止泄漏
+window.addEventListener('pagehide', releaseAllMigrationDownloads);
+
+// 触发一次迁移包下载；准备阶段任何异常都会回收 URL 并向上抛出（不显示成功）
+function downloadMigrationPackage(text, filename) {
+  const blob = new Blob([text], {type: 'application/json'});
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.rel = 'noopener';
+    document.body.appendChild(a);  // 部分浏览器要求元素挂载后才能触发下载
+    a.click();
+    a.remove();
+  } catch (e) {
+    URL.revokeObjectURL(url);  // 下载未被接管：立即回收，不泄漏
+    throw e;
+  }
+  // 下载已交给浏览器：延迟释放，确保慢设备上浏览器已开始读取 Blob
+  const timer = setTimeout(() => releaseMigrationDownload(url),
+                           MIG_DOWNLOAD_REVOKE_DELAY);
+  migPendingDownloads.set(url, timer);
+}
+
+let migExporting = false;  // 导出进行中去重：重复点击不并发
+
 async function exportMigration() {
+  if (migExporting) return;  // 上一次导出尚未完成，忽略重复点击
+  migExporting = true;
   $('mig-export-msg').textContent = '';
   try {
     const res = await fetch('/api/migration/export');
@@ -2129,15 +2181,13 @@ async function exportMigration() {
       <p>数据量：${migCountsHtml(pkg.counts)}<br>
          格式版本：<b>v${pkg.version}</b> · SHA-256：<code>${esc(pkg.sha256)}</code></p>
       <p class="hint">同一数据库重复导出内容稳定（摘要一致）；导入其他实例后再导出摘要也不变。</p></div>`;
-    const blob = new Blob([text], {type: 'application/json'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `allergen_migration_${pkg.sha256.slice(0, 12)}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    downloadMigrationPackage(
+      text, `allergen_migration_${pkg.sha256.slice(0, 12)}.json`);
     $('mig-export-msg').textContent = '迁移包已生成并开始下载';
   } catch (e) {
     $('mig-export-msg').textContent = '导出失败：' + e.message;
+  } finally {
+    migExporting = false;
   }
 }
 
